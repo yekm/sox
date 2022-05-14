@@ -76,8 +76,11 @@ typedef struct {
   int        gain;
   int        spectrum_points;
   int        perm;
+  int        freq_low;
+  int        freq_high;
   sox_bool   monochrome;
   sox_bool   light_background;
+  sox_bool   log_scale;
   sox_bool   high_colour;
   sox_bool   slack_overlap;
   sox_bool   no_axes;
@@ -192,7 +195,7 @@ static int getopts(sox_effect_t *effp, int argc, char **argv)
   int c;
   lsx_getopt_t optstate;
 
-  lsx_getopt_init(argc, argv, "+S:d:x:X:y:Y:z:Z:q:p:W:w:st:c:AarmnlhTo:",
+  lsx_getopt_init(argc, argv, "+S:d:x:X:y:Y:z:Z:q:p:W:f:F:w:st:c:AarmnlLhTo:",
                   NULL, lsx_getopt_flag_none, 1, &optstate);
 
   p->dB_range = 120;
@@ -200,6 +203,8 @@ static int getopts(sox_effect_t *effp, int argc, char **argv)
   p->perm = 1;
   p->out_name = "spectrogram.png";
   p->comment = "Created by SoX";
+  p->freq_low = 0;
+  p->freq_high = INT32_MAX;
 
   while ((c = lsx_getopt(&optstate)) != -1) {
     switch (c) {
@@ -212,6 +217,8 @@ static int getopts(sox_effect_t *effp, int argc, char **argv)
       GETOPT_NUMERIC(optstate, 'q', spectrum_points,  0, p->spectrum_points)
       GETOPT_NUMERIC(optstate, 'p', perm,             1, 6)
       GETOPT_NUMERIC(optstate, 'W', window_adjust,  -10, 10)
+      GETOPT_NUMERIC(optstate, 'f', freq_low,         0, INT32_MAX)
+      GETOPT_NUMERIC(optstate, 'F', freq_high,        0, INT32_MAX)
       case 'w': p->win_type = lsx_enum_option(c, optstate.arg, window_options);
                 break;
       case 's': p->slack_overlap    = sox_true;   break;
@@ -221,6 +228,7 @@ static int getopts(sox_effect_t *effp, int argc, char **argv)
       case 'm': p->monochrome       = sox_true;   break;
       case 'n': p->normalize        = sox_true;   break;
       case 'l': p->light_background = sox_true;   break;
+      case 'L': p->log_scale        = sox_true;   break;
       case 'h': p->high_colour      = sox_true;   break;
       case 'T': p->truncate         = sox_true;   break;
       case 't': p->title            = optstate.arg; break;
@@ -255,6 +263,13 @@ static int getopts(sox_effect_t *effp, int argc, char **argv)
     lsx_fail("only one of -y, -Y may be given");
     return SOX_EOF;
   }
+
+  if (p->freq_low >= p->freq_high) {
+    lsx_fail("Frequency range is invalid. Lower frequency (%d) must be less than higher frequency (%d).",
+        p->freq_low, p->freq_high);
+    return SOX_EOF;
+  }
+  lsx_debug("parsed freq_low=%d freq_high=%d", p->freq_low, p->freq_high);
 
   p->gain = -p->gain;
   --p->perm;
@@ -795,6 +810,24 @@ static int stop(sox_effect_t *effp) /* only called, by end(), on flow 0 */
   double      limit;
   float       autogain = 0.0;	/* Is changed if the -n flag was supplied */
 
+  float log10_low_freq, log10_high_freq;
+  float nyquist_freq = (float)effp->in_signal.rate / 2;
+  lsx_debug("freq_low=%d freq_high=%d nq=%g", p->freq_low, p->freq_high, nyquist_freq);
+
+  /* No chart upper freq set, so use nyquist freq as default */
+  if (p->freq_high == INT32_MAX) {
+    p->freq_high = nyquist_freq;
+  }
+  /* Cannot have 0Hz on log axis. Use 1Hz instead. */
+  if (p->log_scale && p->freq_low==0) {
+    p->freq_low = 1;
+  }
+
+  lsx_debug("freq_low=%d freq_high=%d nq=%g", p->freq_low, p->freq_high, nyquist_freq);
+
+  log10_low_freq = log10f((float)p->freq_low);
+  log10_high_freq = log10f((float)p->freq_high);
+
   free(p->shared);
 
   if (p->using_stdout) {
@@ -839,14 +872,30 @@ static int stop(sox_effect_t *effp) /* only called, by end(), on flow 0 */
     if (p->normalize) {
       float *fp = q->dBfs;
       for (i = p->rows * p->cols; i > 0; i--)
-	*fp++ += autogain;
+      *fp++ += autogain;
     }
+
+    int freq, dBfsi;
+    float log_scale_factor = (float)(log10_high_freq - log10_low_freq) / p->rows;
+    float lin_scale_factor = (float)(p->freq_high - p->freq_low) / p->rows;
 
     base = !p->raw * below + (chans - 1 - k) * (p->rows + 1);
 
     for (j = 0; j < p->rows; ++j) {
+      if (p->log_scale) {
+        freq = (int)powf (10.0, (float)j * log_scale_factor + log10_low_freq);
+      } else {
+        freq = (float)j * lin_scale_factor + p->freq_low;
+      }
+      /* dBfsi: the index into dBfs[] corresponding to frequency at row j */
+      dBfsi = (freq * p->rows) / nyquist_freq;
+      /* It is possible that upper freq > nyquist freq: deal with that */
+      if (dBfsi >= p->rows) {
+        dBfsi = p->rows-1;
+      }
+
       for (i = 0; i < p->cols; ++i)
-        pixel(!p->raw * left + i, base + j) = colour(p, q->dBfs[i*p->rows + j]);
+        pixel(!p->raw * left + i, base + j) = colour(p, q->dBfs[i*p->rows + dBfsi]);
 
       if (!p->raw && !p->no_axes) /* Y-axis lines */
         pixel(left - 1, base + j) = pixel(left + p->cols, base + j) = Grid;
@@ -886,28 +935,68 @@ static int stop(sox_effect_t *effp) /* only called, by end(), on flow 0 */
     }
 
     /* Y-axis */
-    step = axis(effp->in_signal.rate / 2,
-        (p->rows - 1) / ((font_y * 3 + 1) >> 1), &limit, &prefix);
-    sprintf(text, "Frequency (%.1sHz)", prefix);         /* Axis label */
-    print_up(10, below + (c_rows - font_X * strlen(text)) / 2, Text, text);
+    if (p->log_scale) {
+      /* Log Y axis ticks and labels */
 
-    for (k = 0; k < chans; ++k) {
-      base = below + k * (p->rows + 1);
+      int x,y;
+      int start_decade = (int)log10_low_freq;
+      int end_decade = (int)log10_high_freq;
+      float log_scale = (float)p->rows/(log10_high_freq - log10_low_freq);
 
-      for (i = 0; i <= limit; i += step) {
-        int y = limit ? (double)i / limit * (p->rows - 1) + .5 : 0;
-        int x;
+      print_up(10, below + (c_rows - font_X * (int)strlen(text)) / 2, Text, "Frequency (Hz)");
 
-        for (x = 0; x < tick_len; ++x)                   /* Ticks */
-          pixel(left-1-x, base+y) = pixel(left+p->cols+x, base+y) = Grid;
+      for (k = 0; k < chans; ++k) {
+        base = below + k * (p->rows + 1);
 
-        if ((step == 5 && (i%10)) || (!i && k && chans > 1))
-          continue;
+        /* Label 10^n decades in view */
+        for (i = start_decade; i <= end_decade; i++) {
+          int f = (int)powf(10.0,(float)i);
+          y = ( (float)i-log10_low_freq)*log_scale;
 
-        sprintf(text, i?"%5g":"   DC", .1 * i);          /* Tick labels */
-        print_at(left - 4 - font_X * 5, base + y + 5, Labels, text);
-        sprintf(text, i?"%g":"DC", .1 * i);
-        print_at(left + p->cols + 6, base + y + 5, Labels, text);
+          if (y>=0) {
+            sprintf(text, i?"%5i":"   DC",  f);          /* Tick label (left) */
+            print_at(left - 4 - font_X * 5, base + y + 5, Labels, text);
+            sprintf(text, i?"%i":"DC",  f);              /* Tick label (right) */
+            print_at(left + p->cols + 6, base + y + 5, Labels, text);
+          }
+
+          /* intra-decade tick marks */
+          for (j = 0; j < 10; j++) {
+            y = (log10f((float)(f + j*f))-log10_low_freq)*log_scale;
+            if (y>0 && y < p->rows) {
+              for (x = 0; x < tick_len; ++x) {
+                pixel(left-1-x, base+y) = pixel(left+p->cols+x, base+y) = Grid;
+              }
+            }
+          }
+
+        }
+
+      }
+    } else {
+      step = axis(effp->in_signal.rate / 2,
+          (p->rows - 1) / ((font_y * 3 + 1) >> 1), &limit, &prefix);
+      sprintf(text, "Frequency (%.1sHz)", prefix);         /* Axis label */
+      print_up(10, below + (c_rows - font_X * strlen(text)) / 2, Text, text);
+
+      for (k = 0; k < chans; ++k) {
+        base = below + k * (p->rows + 1);
+
+        for (i = 0; i <= limit; i += step) {
+          int y = limit ? (double)i / limit * (p->rows - 1) + .5 : 0;
+          int x;
+
+          for (x = 0; x < tick_len; ++x)                   /* Ticks */
+            pixel(left-1-x, base+y) = pixel(left+p->cols+x, base+y) = Grid;
+
+          if ((step == 5 && (i%10)) || (!i && k && chans > 1))
+            continue;
+
+          sprintf(text, i?"%5g":"   DC", .1 * i);          /* Tick labels */
+          print_at(left - 4 - font_X * 5, base + y + 5, Labels, text);
+          sprintf(text, i?"%g":"DC", .1 * i);
+          print_at(left + p->cols + 6, base + y + 5, Labels, text);
+        }
       }
     }
 
